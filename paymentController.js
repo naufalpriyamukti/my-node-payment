@@ -4,7 +4,7 @@ require('dotenv').config();
 
 // 1. Inisialisasi Midtrans
 let core = new midtransClient.CoreApi({
-    isProduction: false,
+    isProduction: false, // Ganti true jika sudah live
     serverKey: process.env.MIDTRANS_SERVER_KEY,
     clientKey: process.env.MIDTRANS_CLIENT_KEY
 });
@@ -28,7 +28,7 @@ exports.charge = async (req, res) => {
             });
         }
 
-        // Setup Parameter Midtrans
+        // Setup Parameter Midtrans Dasar
         let parameter = {
             "payment_type": paymentType === 'alfamart' ? 'cstore' : 'bank_transfer',
             "transaction_details": {
@@ -41,39 +41,50 @@ exports.charge = async (req, res) => {
             }
         };
 
-        // Bank Transfer Logic
+        // Konfigurasi Spesifik Bank Transfer (BCA, BNI, BRI)
         if (['bca', 'bni', 'bri'].includes(paymentType)) {
             parameter.payment_type = "bank_transfer";
             parameter.bank_transfer = { "bank": paymentType };
         } 
-        
-        // Alfamart Logic
-        if (paymentType === 'alfamart') {
+        // Konfigurasi Spesifik Alfamart
+        else if (paymentType === 'alfamart') {
             parameter.payment_type = "cstore";
             parameter.cstore = { "store": "alfamart", "message": "Tiketons Payment" };
         }
 
-        // A. Create Transaction ke Midtrans
+        // A. Kirim Request ke Midtrans Core API
         const chargeResponse = await core.charge(parameter);
 
-        // B. Ambil Data VA/Kode Bayar
+        // B. Ektraksi Nomor VA / Kode Bayar (SOLUSI PERBAIKAN)
+        // Kita harus mengambil string kode bayar dari struktur JSON yang rumit
         let vaNumber = null;
-        if (chargeResponse.va_numbers) {
-            vaNumber = chargeResponse.va_numbers[0].va_number;
-        } else if (chargeResponse.permata_va_number) {
-            vaNumber = chargeResponse.permata_va_number;
-        } else if (paymentType === 'alfamart') {
-             vaNumber = chargeResponse.payment_code;
+
+        // Cek 1: Jika Bank Transfer (BCA, BNI, BRI)
+        if (chargeResponse.payment_type === 'bank_transfer') {
+            // Midtrans mengembalikan array 'va_numbers', ambil index pertama
+            if (chargeResponse.va_numbers && chargeResponse.va_numbers.length > 0) {
+                 vaNumber = chargeResponse.va_numbers[0].va_number;
+            } 
+            // Khusus Permata (jika nanti dipakai)
+            else if (chargeResponse.permata_va_number) {
+                 vaNumber = chargeResponse.permata_va_number;
+            }
+        } 
+        // Cek 2: Jika Gerai Retail (Alfamart)
+        else if (chargeResponse.payment_type === 'cstore') {
+            vaNumber = chargeResponse.payment_code;
         }
 
-        // C. Response ke Android (Android yang akan simpan status PENDING awal)
+        // C. Kirim Response Bersih ke Android
+        // Android akan menerima 'va_number' sebagai string tunggal, bukan array lagi.
         return res.json({
             status: true,
             message: "Transaksi Berhasil Dibuat",
-            payment_type: paymentType,
-            va_number: vaNumber,
-            total_amount: amount,
-            order_id: orderId
+            order_id: chargeResponse.order_id,
+            total_amount: chargeResponse.gross_amount,
+            payment_type: chargeResponse.payment_type,
+            va_number: vaNumber, // <-- INI KUNCI PERBAIKANNYA
+            qr_url: null 
         });
 
     } catch (error) {
@@ -100,11 +111,8 @@ exports.notification = async (req, res) => {
         let finalStatus = 'PENDING';
 
         if (transactionStatus == 'capture') {
-            if (fraudStatus == 'challenge') {
-                finalStatus = 'CHALLENGE';
-            } else if (fraudStatus == 'accept') {
-                finalStatus = 'SUCCESS';
-            }
+            if (fraudStatus == 'challenge') finalStatus = 'CHALLENGE';
+            else if (fraudStatus == 'accept') finalStatus = 'SUCCESS';
         } else if (transactionStatus == 'settlement') {
             finalStatus = 'SUCCESS';
         } else if (transactionStatus == 'cancel' || transactionStatus == 'deny' || transactionStatus == 'expire') {
@@ -124,7 +132,7 @@ exports.notification = async (req, res) => {
             return res.status(500).send('DB Error');
         }
 
-        // 2. JIKA SUKSES, BUAT TIKET OTOMATIS (Opsional tapi Recommended)
+        // 2. JIKA SUKSES, BUAT TIKET OTOMATIS
         if (finalStatus === 'SUCCESS') {
             await createTicketAutomatic(orderId);
         }
