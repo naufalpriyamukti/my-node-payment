@@ -7,20 +7,20 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
-app.use(cors()); // Agar Android bisa akses (Cross-Origin)
+app.use(cors());
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
-// Routes
 app.get('/', (req, res) => {
     res.send('Tiketons Payment Gateway is Running...');
 });
 
-// Endpoint Utama yang dipanggil Android
+// 1. Android panggil ini untuk minta Kode Bayar
 app.post('/api/payment/charge', paymentController.charge);
 
-// Start Server
+// 2. Midtrans panggil ini (Otomatis) untuk lapor status bayar
+app.post('/api/payment/notification', paymentController.notification);
+
 app.listen(PORT, () => {
     console.log(`Server berjalan di http://localhost:${PORT}`);
 });
