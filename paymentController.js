@@ -2,9 +2,16 @@ const midtransClient = require('midtrans-client');
 const { createClient } = require('@supabase/supabase-js');
 require('dotenv').config();
 
+// --- 0. DEBUGGING AWAL (Cek apakah env terbaca) ---
+console.log("--- [INIT] SERVER STARTING ---");
+console.log("Is Production Mode:", false); // Karena hardcoded false
+console.log("Midtrans Server Key Loaded:", process.env.MIDTRANS_SERVER_KEY ? "YES (****" + process.env.MIDTRANS_SERVER_KEY.slice(-4) + ")" : "NO (UNDEFINED)");
+console.log("Supabase URL Loaded:", process.env.SUPABASE_URL ? "YES" : "NO");
+console.log("Supabase Key Loaded:", process.env.SUPABASE_SERVICE_KEY ? "YES (****" + process.env.SUPABASE_SERVICE_KEY.slice(-4) + ")" : "NO");
+
 // 1. Inisialisasi Midtrans
 let core = new midtransClient.CoreApi({
-    isProduction: false,
+    isProduction: false, // <--- INI ARTINYA PAKAI SANDBOX (SIMULATOR)
     serverKey: process.env.MIDTRANS_SERVER_KEY,
     clientKey: process.env.MIDTRANS_CLIENT_KEY
 });
@@ -15,18 +22,22 @@ const supabase = createClient(
     process.env.SUPABASE_SERVICE_KEY
 );
 
-// --- ENDPOINT 1: REQUEST BAYAR (Android -> Node.js -> Midtrans) ---
+// --- ENDPOINT 1: REQUEST BAYAR ---
 exports.charge = async (req, res) => {
     try {
-        // Terima data lengkap dari Android
         const { orderId, amount, paymentType, customerName, customerEmail, userId, eventId, tribunName } = req.body;
 
-        // Validasi dasar
+        // DEBUG: Cek data yang masuk dari Android
+        console.log(`\n--- [REQ] CHARGE REQUEST ---`);
+        console.log(`OrderID: ${orderId}, Amount: ${amount}, Type: ${paymentType}`);
+        console.log(`User: ${customerName} (${userId})`);
+
         if (!orderId || !amount || !paymentType) {
-            return res.status(400).json({ status: false, message: "Data tidak lengkap (orderId/amount/paymentType)" });
+            console.error("[ERROR] Data tidak lengkap!");
+            return res.status(400).json({ status: false, message: "Data tidak lengkap" });
         }
 
-        // Setup Parameter Midtrans
+        // Setup Parameter
         let parameter = {
             "payment_type": paymentType === 'alfamart' ? 'cstore' : 'bank_transfer',
             "transaction_details": {
@@ -39,7 +50,6 @@ exports.charge = async (req, res) => {
             }
         };
 
-        // Set Bank / Store
         if (['bca', 'bni', 'bri', 'permata'].includes(paymentType)) {
             parameter.payment_type = "bank_transfer";
             parameter.bank_transfer = { "bank": paymentType };
@@ -49,10 +59,20 @@ exports.charge = async (req, res) => {
         }
 
         // 1. Request ke Midtrans
-        console.log(`[Server] Charge Order: ${orderId} via ${paymentType}`);
-        const chargeResponse = await core.charge(parameter);
+        console.log(`[PROCESS] Menghubungi Midtrans...`);
+        
+        // TRY CATCH KHUSUS MIDTRANS UNTUK MELIHAT RESPONSE RAW
+        let chargeResponse;
+        try {
+            chargeResponse = await core.charge(parameter);
+            // LOG PENTING: Response Asli Midtrans
+            console.log("[DEBUG] Midtrans Response RAW:", JSON.stringify(chargeResponse, null, 2));
+        } catch (midError) {
+            console.error("[ERROR] Midtrans Request Failed:", midError.message);
+            return res.status(500).json({ status: false, message: "Midtrans Error: " + midError.message });
+        }
 
-        // 2. Ekstraksi VA Number / Kode Bayar
+        // 2. Ekstraksi VA
         let vaNumber = null;
         let bankName = paymentType;
 
@@ -62,18 +82,20 @@ exports.charge = async (req, res) => {
         } else if (chargeResponse.permata_va_number) {
              vaNumber = chargeResponse.permata_va_number;
         } else if (chargeResponse.payment_code) {
-            vaNumber = chargeResponse.payment_code; // Untuk Alfamart
+            vaNumber = chargeResponse.payment_code;
         }
 
-        // 3. SIMPAN KE DATABASE
+        console.log(`[INFO] VA Number didapat: ${vaNumber}`);
+
+        // 3. Simpan ke Database
         const { error: insertError } = await supabase
             .from('transactions')
             .insert({
                 order_id: orderId,
-                user_id: userId,        // Wajib dikirim dari Android
-                event_id: eventId,      // Wajib dikirim dari Android
+                user_id: userId,
+                event_id: eventId,
                 amount: amount,
-                payment_type: bankName, // Otomatis terisi (tidak NULL lagi)
+                payment_type: bankName,
                 va_number: vaNumber,
                 status: 'PENDING',
                 tribun: tribunName,
@@ -81,12 +103,15 @@ exports.charge = async (req, res) => {
             });
 
         if (insertError) {
-            console.error("Gagal simpan ke DB:", insertError);
-            // Kita tetap kirim response sukses ke user agar dia dapat VA, 
-            // tapi admin harus cek log jika ini terjadi.
+            // LOG LENGKAP SUPABASE ERROR
+            console.error("--- [ERROR] GAGAL SIMPAN DB ---");
+            console.error("Code:", insertError.code);
+            console.error("Message:", insertError.message);
+            console.error("Hint:", insertError.hint || "No hint");
+        } else {
+            console.log("[SUCCESS] Data tersimpan di Database Supabase");
         }
 
-        // 4. Kirim Response ke Android
         return res.json({
             status: true,
             message: "Transaksi Berhasil Dibuat",
@@ -100,20 +125,22 @@ exports.charge = async (req, res) => {
         });
 
     } catch (error) {
-        console.error("Midtrans Error:", error.message);
+        console.error("[CRITICAL ERROR]:", error);
         return res.status(500).json({ status: false, message: error.message });
     }
 };
 
-// --- ENDPOINT 2: NOTIFIKASI STATUS (Webhook Midtrans) ---
+// --- ENDPOINT 2: NOTIFIKASI ---
 exports.notification = async (req, res) => {
     try {
+        console.log("\n--- [WEBHOOK] NOTIFIKASI MASUK ---");
+        
         const statusResponse = await core.transaction.notification(req.body);
         const orderId = statusResponse.order_id;
         const transactionStatus = statusResponse.transaction_status;
         const fraudStatus = statusResponse.fraud_status;
 
-        console.log(`Notifikasi: ${orderId} status ${transactionStatus}`);
+        console.log(`Order: ${orderId} | Status: ${transactionStatus} | Fraud: ${fraudStatus}`);
 
         let finalStatus = 'PENDING';
         if (transactionStatus == 'capture' || transactionStatus == 'settlement') {
@@ -123,46 +150,51 @@ exports.notification = async (req, res) => {
             finalStatus = 'FAILED';
         }
 
-        // Update Database Supabase
+        console.log(`Status update ke DB menjadi: ${finalStatus}`);
+
         const { error } = await supabase
             .from('transactions')
             .update({ status: finalStatus })
             .eq('order_id', orderId);
 
-        if (error) console.error("DB Update Error:", error);
+        if (error) {
+             console.error("[ERROR] Gagal Update Status DB:", error.message);
+        } else {
+             console.log("[SUCCESS] Status DB Updated!");
+        }
 
-        // Jika Sukses, Buat Tiket Otomatis
         if (finalStatus === 'SUCCESS') {
             await createTicketAutomatic(orderId);
         }
 
         return res.status(200).send('OK');
     } catch (error) {
-        console.error("Notification Error:", error);
+        console.error("[ERROR] Notification Webhook:", error.message);
         return res.status(500).send('Error');
     }
 };
 
-// Fungsi helper: Membuat Tiket di Tabel 'tickets' setelah bayar
 async function createTicketAutomatic(orderId) {
     try {
-        // 1. Ambil data transaksi
+        console.log(`[TICKET] Membuat tiket untuk ${orderId}...`);
+        
         const { data: trx, error: errTrx } = await supabase
             .from('transactions')
             .select('*')
             .eq('order_id', orderId)
             .single();
 
-        if (errTrx || !trx) return;
+        if (errTrx || !trx) {
+            console.error("[ERROR] Transaksi tidak ditemukan saat buat tiket:", errTrx?.message);
+            return;
+        }
 
-        // 2. Ambil data event untuk detail tiket
         const { data: event } = await supabase
             .from('events')
             .select('*')
-            .eq('id', trx.event_id) // Asumsi kolom foreign key di trx adalah event_id
+            .eq('id', trx.event_id)
             .single();
 
-        // 3. Masukkan ke tabel tickets
         const { error: errTiket } = await supabase
             .from('tickets')
             .insert({
@@ -172,14 +204,14 @@ async function createTicketAutomatic(orderId) {
                 event_date: event ? event.date : new Date(),
                 location: event ? event.location : "-",
                 tribun: trx.tribun,
-                qr_code: `QR-${orderId}-${Date.now()}`, // Generate Simple QR String
+                qr_code: `QR-${orderId}-${Date.now()}`,
                 is_used: false
             });
         
-        if (!errTiket) console.log(`Tiket BERHASIL dibuat untuk ${orderId}`);
-        else console.error(`Gagal buat tiket: ${errTiket.message}`);
+        if (!errTiket) console.log(`[SUCCESS] Tiket BERHASIL dibuat!`);
+        else console.error(`[ERROR] Gagal insert tiket: ${errTiket.message}`);
 
     } catch (e) {
-        console.error("Error createTicketAutomatic:", e);
+        console.error("[ERROR] createTicketAutomatic Exception:", e);
     }
 }
