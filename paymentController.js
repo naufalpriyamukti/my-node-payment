@@ -18,12 +18,12 @@ const supabase = createClient(
 // --- ENDPOINT 1: REQUEST BAYAR (Android -> Node.js -> Midtrans) ---
 exports.charge = async (req, res) => {
     try {
-        // Terima data dari Android. Pastikan userId juga dikirim untuk database
+        // Terima data lengkap dari Android
         const { orderId, amount, paymentType, customerName, customerEmail, userId, eventId, tribunName } = req.body;
 
-        // Validasi
+        // Validasi dasar
         if (!orderId || !amount || !paymentType) {
-            return res.status(400).json({ status: false, message: "Data tidak lengkap" });
+            return res.status(400).json({ status: false, message: "Data tidak lengkap (orderId/amount/paymentType)" });
         }
 
         // Setup Parameter Midtrans
@@ -62,28 +62,28 @@ exports.charge = async (req, res) => {
         } else if (chargeResponse.permata_va_number) {
              vaNumber = chargeResponse.permata_va_number;
         } else if (chargeResponse.payment_code) {
-            vaNumber = chargeResponse.payment_code; // Untuk Alfamart/Indomaret
+            vaNumber = chargeResponse.payment_code; // Untuk Alfamart
         }
 
-        // 3. SIMPAN KE DATABASE (PENTING: INI YANG KURANG SEBELUMNYA)
-        // Kita simpan status 'PENDING' dan va_number yang didapat
+        // 3. SIMPAN KE DATABASE
         const { error: insertError } = await supabase
             .from('transactions')
             .insert({
                 order_id: orderId,
-                user_id: userId, // Pastikan dikirim dari Android
-                event_id: eventId, // Pastikan dikirim dari Android
+                user_id: userId,        // Wajib dikirim dari Android
+                event_id: eventId,      // Wajib dikirim dari Android
                 amount: amount,
-                payment_type: bankName,
+                payment_type: bankName, // Otomatis terisi (tidak NULL lagi)
                 va_number: vaNumber,
                 status: 'PENDING',
-                tribun: tribunName, // Jika ada info kursi
+                tribun: tribunName,
                 created_at: new Date()
             });
 
         if (insertError) {
             console.error("Gagal simpan ke DB:", insertError);
-            // Tetap lanjut return response ke user, tapi catat error log
+            // Kita tetap kirim response sukses ke user agar dia dapat VA, 
+            // tapi admin harus cek log jika ini terjadi.
         }
 
         // 4. Kirim Response ke Android
@@ -94,8 +94,8 @@ exports.charge = async (req, res) => {
                 order_id: chargeResponse.order_id,
                 total_amount: chargeResponse.gross_amount,
                 payment_type: bankName,
-                va_number: vaNumber, // Android langsung dapat nomornya disini!
-                expiration_time: chargeResponse.expiry_time // Opsional
+                va_number: vaNumber,
+                expiration_time: chargeResponse.expiry_time
             }
         });
 
@@ -105,7 +105,7 @@ exports.charge = async (req, res) => {
     }
 };
 
-// --- ENDPOINT 2: NOTIFIKASI STATUS (Webook Midtrans) ---
+// --- ENDPOINT 2: NOTIFIKASI STATUS (Webhook Midtrans) ---
 exports.notification = async (req, res) => {
     try {
         const statusResponse = await core.transaction.notification(req.body);
@@ -125,13 +125,13 @@ exports.notification = async (req, res) => {
 
         // Update Database Supabase
         const { error } = await supabase
-            .from('transactions') // Pastikan nama tabel benar
+            .from('transactions')
             .update({ status: finalStatus })
             .eq('order_id', orderId);
 
         if (error) console.error("DB Update Error:", error);
 
-        // Jika Sukses, Buat Tiket
+        // Jika Sukses, Buat Tiket Otomatis
         if (finalStatus === 'SUCCESS') {
             await createTicketAutomatic(orderId);
         }
@@ -143,8 +143,43 @@ exports.notification = async (req, res) => {
     }
 };
 
-// Fungsi helper createTicketAutomatic (sama seperti sebelumnya, pastikan tabelnya ada)
+// Fungsi helper: Membuat Tiket di Tabel 'tickets' setelah bayar
 async function createTicketAutomatic(orderId) {
-    // Logika buat tiket... (Kode kamu sebelumnya sudah oke disini)
-     console.log(`Tiket dibuat untuk ${orderId}`);
+    try {
+        // 1. Ambil data transaksi
+        const { data: trx, error: errTrx } = await supabase
+            .from('transactions')
+            .select('*')
+            .eq('order_id', orderId)
+            .single();
+
+        if (errTrx || !trx) return;
+
+        // 2. Ambil data event untuk detail tiket
+        const { data: event } = await supabase
+            .from('events')
+            .select('*')
+            .eq('id', trx.event_id) // Asumsi kolom foreign key di trx adalah event_id
+            .single();
+
+        // 3. Masukkan ke tabel tickets
+        const { error: errTiket } = await supabase
+            .from('tickets')
+            .insert({
+                transaction_id: orderId,
+                user_id: trx.user_id,
+                event_name: event ? event.name : "Event Tiketons",
+                event_date: event ? event.date : new Date(),
+                location: event ? event.location : "-",
+                tribun: trx.tribun,
+                qr_code: `QR-${orderId}-${Date.now()}`, // Generate Simple QR String
+                is_used: false
+            });
+        
+        if (!errTiket) console.log(`Tiket BERHASIL dibuat untuk ${orderId}`);
+        else console.error(`Gagal buat tiket: ${errTiket.message}`);
+
+    } catch (e) {
+        console.error("Error createTicketAutomatic:", e);
+    }
 }
