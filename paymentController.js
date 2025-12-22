@@ -4,12 +4,12 @@ require('dotenv').config();
 
 // 1. Inisialisasi Midtrans
 let core = new midtransClient.CoreApi({
-    isProduction: false, // Ganti true jika sudah live
+    isProduction: false, // Ubah ke true jika sudah production
     serverKey: process.env.MIDTRANS_SERVER_KEY,
     clientKey: process.env.MIDTRANS_CLIENT_KEY
 });
 
-// 2. Inisialisasi Supabase (Admin Mode)
+// 2. Inisialisasi Supabase (Service Role / Admin)
 const supabase = createClient(
     process.env.SUPABASE_URL,
     process.env.SUPABASE_SERVICE_KEY
@@ -20,71 +20,76 @@ exports.charge = async (req, res) => {
     try {
         const { orderId, amount, paymentType, customerName, customerEmail } = req.body;
 
-        // Validasi input
+        // Validasi input sederhana
         if (!orderId || !amount || !paymentType) {
             return res.status(400).json({
                 status: false,
-                message: "Data tidak lengkap"
+                message: "Data tidak lengkap (Butuh orderId, amount, paymentType)"
             });
         }
 
-        // Setup Parameter Midtrans Dasar
+        // Setup Parameter Dasar Midtrans
         let parameter = {
             "payment_type": paymentType === 'alfamart' ? 'cstore' : 'bank_transfer',
             "transaction_details": {
+                // Pastikan amount jadi integer agar tidak ditolak Midtrans
                 "gross_amount": parseInt(amount),
                 "order_id": orderId,
             },
             "customer_details": {
-                "first_name": customerName,
-                "email": customerEmail
+                "first_name": customerName || "Customer",
+                "email": customerEmail || "customer@example.com"
             }
         };
 
-        // Konfigurasi Spesifik Bank Transfer (BCA, BNI, BRI)
+        // Konfigurasi Bank Transfer (BCA, BNI, BRI)
         if (['bca', 'bni', 'bri'].includes(paymentType)) {
             parameter.payment_type = "bank_transfer";
             parameter.bank_transfer = { "bank": paymentType };
         } 
-        // Konfigurasi Spesifik Alfamart
+        // Konfigurasi Gerai (Alfamart)
         else if (paymentType === 'alfamart') {
             parameter.payment_type = "cstore";
-            parameter.cstore = { "store": "alfamart", "message": "Tiketons Payment" };
+            parameter.cstore = { "store": "alfamart", "message": "Pembayaran Tiket" };
         }
 
-        // A. Kirim Request ke Midtrans Core API
+        // --- REQUEST KE MIDTRANS ---
+        console.log(`Mengirim request ke Midtrans untuk Order: ${orderId}`);
         const chargeResponse = await core.charge(parameter);
+        console.log("Respon Midtrans:", JSON.stringify(chargeResponse)); // Log untuk debugging di Railway
 
-        // B. Ektraksi Nomor VA / Kode Bayar (SOLUSI PERBAIKAN)
-        // Kita harus mengambil string kode bayar dari struktur JSON yang rumit
+        // --- EKSTRAKSI KODE BAYAR (VA NUMBER) ---
+        // Ini bagian paling penting agar di Android tidak Null!
         let vaNumber = null;
 
-        // Cek 1: Jika Bank Transfer (BCA, BNI, BRI)
         if (chargeResponse.payment_type === 'bank_transfer') {
-            // Midtrans mengembalikan array 'va_numbers', ambil index pertama
+            // Cek apakah ada array va_numbers (BCA, BNI, BRI)
             if (chargeResponse.va_numbers && chargeResponse.va_numbers.length > 0) {
                  vaNumber = chargeResponse.va_numbers[0].va_number;
             } 
-            // Khusus Permata (jika nanti dipakai)
+            // Cek khusus Permata (Formatnya beda, bukan array)
             else if (chargeResponse.permata_va_number) {
                  vaNumber = chargeResponse.permata_va_number;
             }
         } 
-        // Cek 2: Jika Gerai Retail (Alfamart)
         else if (chargeResponse.payment_type === 'cstore') {
+            // Alfamart/Indomaret pakai payment_code
             vaNumber = chargeResponse.payment_code;
         }
 
-        // C. Kirim Response Bersih ke Android
-        // Android akan menerima 'va_number' sebagai string tunggal, bukan array lagi.
+        // --- KIRIM RESPONSE KE ANDROID ---
         return res.json({
             status: true,
             message: "Transaksi Berhasil Dibuat",
             order_id: chargeResponse.order_id,
-            total_amount: chargeResponse.gross_amount,
+            // Kirim amount sebagai string agar aman
+            total_amount: chargeResponse.gross_amount.toString(),
             payment_type: chargeResponse.payment_type,
-            va_number: vaNumber, // <-- INI KUNCI PERBAIKANNYA
-            qr_url: null 
+            
+            // Variabel ini yang ditunggu Android
+            va_number: vaNumber, 
+            
+            qr_url: null // Null dulu karena belum pakai QRIS
         });
 
     } catch (error) {
@@ -96,7 +101,7 @@ exports.charge = async (req, res) => {
     }
 };
 
-// --- ENDPOINT 2: NOTIFIKASI STATUS (Midtrans -> Node.js -> Database) ---
+// --- ENDPOINT 2: NOTIFIKASI STATUS (Midtrans -> Node.js) ---
 exports.notification = async (req, res) => {
     try {
         const statusResponse = await core.transaction.notification(req.body);
@@ -105,9 +110,9 @@ exports.notification = async (req, res) => {
         const transactionStatus = statusResponse.transaction_status;
         const fraudStatus = statusResponse.fraud_status;
 
-        console.log(`Notifikasi diterima: Order ${orderId} statusnya ${transactionStatus}`);
+        console.log(`Notifikasi Masuk: Order ${orderId} -> ${transactionStatus}`);
 
-        // Tentukan Status Akhir untuk Database
+        // Tentukan Status untuk Database
         let finalStatus = 'PENDING';
 
         if (transactionStatus == 'capture') {
@@ -121,14 +126,14 @@ exports.notification = async (req, res) => {
             finalStatus = 'PENDING';
         }
 
-        // 1. UPDATE STATUS DI TABEL TRANSACTIONS
+        // 1. UPDATE STATUS DI SUPABASE
         const { error: updateError } = await supabase
             .from('transactions')
             .update({ status: finalStatus })
             .eq('order_id', orderId);
 
         if (updateError) {
-            console.error("Gagal update DB Transaction:", updateError);
+            console.error("Gagal update DB:", updateError);
             return res.status(500).send('DB Error');
         }
 
@@ -145,9 +150,9 @@ exports.notification = async (req, res) => {
     }
 };
 
-// Fungsi Helper: Buat Tiket di Tabel 'tickets' otomatis
+// Fungsi Helper: Buat Tiket otomatis saat pembayaran sukses
 async function createTicketAutomatic(orderId) {
-    // Ambil data transaksi dulu untuk tau user_id dan event_id
+    // Ambil data transaksi
     const { data: trx, error } = await supabase
         .from('transactions')
         .select('*')
@@ -156,23 +161,23 @@ async function createTicketAutomatic(orderId) {
 
     if (error || !trx) return;
 
-    // Cek apakah tiket sudah dibuat agar tidak duplikat
+    // Cek duplikasi tiket
     const { data: existing } = await supabase
         .from('tickets')
         .select('id')
         .eq('transaction_id', orderId)
         .single();
 
-    if (existing) return; // Sudah ada, skip
+    if (existing) return; 
 
-    // Insert Tiket Baru
-    // Ambil Detail Event (Tgl, Lokasi) untuk snapshot tiket
+    // Ambil info Event
     const { data: event } = await supabase
         .from('events')
         .select('*')
         .eq('id', trx.event_id)
         .single();
 
+    // Simpan Tiket
     await supabase.from('tickets').insert({
         transaction_id: orderId,
         user_id: trx.user_id,
@@ -180,7 +185,7 @@ async function createTicketAutomatic(orderId) {
         event_date: event?.date,
         location: event?.location,
         tribun: trx.tribun,
-        qr_code: `TIKET-${orderId}-${Math.floor(Math.random() * 1000)}` // Generate QR String Simple
+        qr_code: `TIKET-${orderId}-${Math.floor(Math.random() * 1000)}`
     });
     
     console.log(`Tiket berhasil dibuat untuk Order ${orderId}`);
