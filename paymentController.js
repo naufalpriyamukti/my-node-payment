@@ -9,7 +9,7 @@ let core = new midtransClient.CoreApi({
     clientKey: process.env.MIDTRANS_CLIENT_KEY
 });
 
-// 2. Inisialisasi Supabase (Service Role / Admin)
+// 2. Inisialisasi Supabase
 const supabase = createClient(
     process.env.SUPABASE_URL,
     process.env.SUPABASE_SERVICE_KEY
@@ -20,25 +20,24 @@ exports.charge = async (req, res) => {
     try {
         const { orderId, amount, paymentType, customerName, customerEmail } = req.body;
 
-        // Validasi input sederhana
+        // Validasi Input
         if (!orderId || !amount || !paymentType) {
             return res.status(400).json({
                 status: false,
-                message: "Data tidak lengkap (Butuh orderId, amount, paymentType)"
+                message: "Data tidak lengkap (orderId, amount, paymentType required)"
             });
         }
 
-        // Setup Parameter Dasar Midtrans
+        // Setup Parameter Midtrans
         let parameter = {
             "payment_type": paymentType === 'alfamart' ? 'cstore' : 'bank_transfer',
             "transaction_details": {
-                // Pastikan amount jadi integer agar tidak ditolak Midtrans
-                "gross_amount": parseInt(amount),
+                "gross_amount": parseInt(amount), // Pastikan integer
                 "order_id": orderId,
             },
             "customer_details": {
                 "first_name": customerName || "Customer",
-                "email": customerEmail || "customer@example.com"
+                "email": customerEmail || "email@example.com"
             }
         };
 
@@ -47,48 +46,52 @@ exports.charge = async (req, res) => {
             parameter.payment_type = "bank_transfer";
             parameter.bank_transfer = { "bank": paymentType };
         } 
-        // Konfigurasi Spesifik Gerai (Alfamart)
+        // Konfigurasi Spesifik Alfamart
         else if (paymentType === 'alfamart') {
             parameter.payment_type = "cstore";
             parameter.cstore = { "store": "alfamart", "message": "Tiketons Payment" };
         }
 
-        // --- REQUEST KE MIDTRANS ---
-        console.log(`Mengirim request ke Midtrans untuk Order: ${orderId}`);
+        // --- 1. REQUEST KE MIDTRANS ---
+        console.log(`[Server] Mengirim request ke Midtrans: Order ${orderId}`);
         const chargeResponse = await core.charge(parameter);
-        
-        // Log respon mentah dari Midtrans untuk debugging di Railway
-        console.log("Respon Midtrans Raw:", JSON.stringify(chargeResponse)); 
 
-        // --- EKSTRAKSI KODE BAYAR (VA NUMBER) - VERSI ROBUST ---
-        // Kita gunakan logika "Greedy" (Cek semua kemungkinan)
+        // --- 2. DEBUG LOG (PENTING: UNTUK CEK RAW JSON DI RAILWAY) ---
+        console.log("=== RAW MIDTRANS RESPONSE ===");
+        console.log(JSON.stringify(chargeResponse, null, 2));
+        console.log("=============================");
+
+        // --- 3. LOGIKA EKSTRAKSI VA NUMBER (METODE GREEDY / SAPU JAGAT) ---
         let vaNumber = null;
 
-        // Cek 1: Apakah ada di dalam array 'va_numbers'? (BCA, BNI, BRI biasanya disini)
-        if (chargeResponse.va_numbers && chargeResponse.va_numbers.length > 0) {
+        // Cek 1: Apakah ada Array 'va_numbers'? (BCA, BNI, BRI)
+        if (chargeResponse.va_numbers && Array.isArray(chargeResponse.va_numbers) && chargeResponse.va_numbers.length > 0) {
              vaNumber = chargeResponse.va_numbers[0].va_number;
+             console.log("[Logic] VA Number ditemukan di array va_numbers:", vaNumber);
         } 
-        // Cek 2: Apakah ada properti 'permata_va_number'? (Format Permata beda sendiri)
+        // Cek 2: Apakah ada 'permata_va_number'?
         else if (chargeResponse.permata_va_number) {
              vaNumber = chargeResponse.permata_va_number;
+             console.log("[Logic] VA Number ditemukan di permata_va_number:", vaNumber);
         }
-        // Cek 3: Apakah ada 'payment_code'? (Indomaret/Alfamart)
+        // Cek 3: Apakah ada 'payment_code'? (Alfamart/Indomaret)
         else if (chargeResponse.payment_code) {
             vaNumber = chargeResponse.payment_code;
+            console.log("[Logic] Kode Bayar ditemukan di payment_code:", vaNumber);
+        } else {
+            console.warn("[Logic] PERINGATAN: Tidak ditemukan kode bayar dimanapun!");
         }
 
-        console.log("Extracted VA Number:", vaNumber); // Pastikan ini tidak null di Log Railway
-
-        // --- KIRIM RESPONSE BERSIH KE ANDROID ---
+        // --- 4. KIRIM RESPONSE KE ANDROID ---
         return res.json({
             status: true,
             message: "Transaksi Berhasil Dibuat",
             order_id: chargeResponse.order_id,
-            // Kirim amount sebagai string agar aman di Android (Serialization)
+            // Convert ke String biar aman di Android
             total_amount: chargeResponse.gross_amount.toString(),
             payment_type: chargeResponse.payment_type,
             
-            // Variabel ini yang ditunggu Android (String bersih)
+            // Variabel kuncinya disini (sudah hasil ekstraksi greedy):
             va_number: vaNumber, 
             
             qr_url: null 
@@ -128,7 +131,7 @@ exports.notification = async (req, res) => {
             finalStatus = 'PENDING';
         }
 
-        // 1. UPDATE STATUS DI SUPABASE
+        // Update ke Database Supabase
         const { error: updateError } = await supabase
             .from('transactions')
             .update({ status: finalStatus })
@@ -139,7 +142,7 @@ exports.notification = async (req, res) => {
             return res.status(500).send('DB Error');
         }
 
-        // 2. JIKA SUKSES, BUAT TIKET OTOMATIS
+        // Jika Sukses, Buat Tiket Otomatis
         if (finalStatus === 'SUCCESS') {
             await createTicketAutomatic(orderId);
         }
@@ -163,7 +166,7 @@ async function createTicketAutomatic(orderId) {
 
     if (error || !trx) return;
 
-    // Cek duplikasi tiket (biar gak double)
+    // Cek duplikasi tiket
     const { data: existing } = await supabase
         .from('tickets')
         .select('id')
