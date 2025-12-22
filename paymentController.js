@@ -4,7 +4,7 @@ require('dotenv').config();
 
 // 1. Inisialisasi Midtrans
 let core = new midtransClient.CoreApi({
-    isProduction: false, // Ubah ke true jika sudah production
+    isProduction: false, // Ubah ke true jika sudah live production
     serverKey: process.env.MIDTRANS_SERVER_KEY,
     clientKey: process.env.MIDTRANS_CLIENT_KEY
 });
@@ -42,54 +42,56 @@ exports.charge = async (req, res) => {
             }
         };
 
-        // Konfigurasi Bank Transfer (BCA, BNI, BRI)
+        // Konfigurasi Spesifik Bank Transfer (BCA, BNI, BRI)
         if (['bca', 'bni', 'bri'].includes(paymentType)) {
             parameter.payment_type = "bank_transfer";
             parameter.bank_transfer = { "bank": paymentType };
         } 
-        // Konfigurasi Gerai (Alfamart)
+        // Konfigurasi Spesifik Gerai (Alfamart)
         else if (paymentType === 'alfamart') {
             parameter.payment_type = "cstore";
-            parameter.cstore = { "store": "alfamart", "message": "Pembayaran Tiket" };
+            parameter.cstore = { "store": "alfamart", "message": "Tiketons Payment" };
         }
 
         // --- REQUEST KE MIDTRANS ---
         console.log(`Mengirim request ke Midtrans untuk Order: ${orderId}`);
         const chargeResponse = await core.charge(parameter);
-        console.log("Respon Midtrans:", JSON.stringify(chargeResponse)); // Log untuk debugging di Railway
+        
+        // Log respon mentah dari Midtrans untuk debugging di Railway
+        console.log("Respon Midtrans Raw:", JSON.stringify(chargeResponse)); 
 
-        // --- EKSTRAKSI KODE BAYAR (VA NUMBER) ---
-        // Ini bagian paling penting agar di Android tidak Null!
+        // --- EKSTRAKSI KODE BAYAR (VA NUMBER) - VERSI ROBUST ---
+        // Kita gunakan logika "Greedy" (Cek semua kemungkinan)
         let vaNumber = null;
 
-        if (chargeResponse.payment_type === 'bank_transfer') {
-            // Cek apakah ada array va_numbers (BCA, BNI, BRI)
-            if (chargeResponse.va_numbers && chargeResponse.va_numbers.length > 0) {
-                 vaNumber = chargeResponse.va_numbers[0].va_number;
-            } 
-            // Cek khusus Permata (Formatnya beda, bukan array)
-            else if (chargeResponse.permata_va_number) {
-                 vaNumber = chargeResponse.permata_va_number;
-            }
+        // Cek 1: Apakah ada di dalam array 'va_numbers'? (BCA, BNI, BRI biasanya disini)
+        if (chargeResponse.va_numbers && chargeResponse.va_numbers.length > 0) {
+             vaNumber = chargeResponse.va_numbers[0].va_number;
         } 
-        else if (chargeResponse.payment_type === 'cstore') {
-            // Alfamart/Indomaret pakai payment_code
+        // Cek 2: Apakah ada properti 'permata_va_number'? (Format Permata beda sendiri)
+        else if (chargeResponse.permata_va_number) {
+             vaNumber = chargeResponse.permata_va_number;
+        }
+        // Cek 3: Apakah ada 'payment_code'? (Indomaret/Alfamart)
+        else if (chargeResponse.payment_code) {
             vaNumber = chargeResponse.payment_code;
         }
 
-        // --- KIRIM RESPONSE KE ANDROID ---
+        console.log("Extracted VA Number:", vaNumber); // Pastikan ini tidak null di Log Railway
+
+        // --- KIRIM RESPONSE BERSIH KE ANDROID ---
         return res.json({
             status: true,
             message: "Transaksi Berhasil Dibuat",
             order_id: chargeResponse.order_id,
-            // Kirim amount sebagai string agar aman
+            // Kirim amount sebagai string agar aman di Android (Serialization)
             total_amount: chargeResponse.gross_amount.toString(),
             payment_type: chargeResponse.payment_type,
             
-            // Variabel ini yang ditunggu Android
+            // Variabel ini yang ditunggu Android (String bersih)
             va_number: vaNumber, 
             
-            qr_url: null // Null dulu karena belum pakai QRIS
+            qr_url: null 
         });
 
     } catch (error) {
@@ -112,7 +114,7 @@ exports.notification = async (req, res) => {
 
         console.log(`Notifikasi Masuk: Order ${orderId} -> ${transactionStatus}`);
 
-        // Tentukan Status untuk Database
+        // Tentukan Status Akhir untuk Database
         let finalStatus = 'PENDING';
 
         if (transactionStatus == 'capture') {
@@ -133,7 +135,7 @@ exports.notification = async (req, res) => {
             .eq('order_id', orderId);
 
         if (updateError) {
-            console.error("Gagal update DB:", updateError);
+            console.error("Gagal update DB Transaction:", updateError);
             return res.status(500).send('DB Error');
         }
 
@@ -161,7 +163,7 @@ async function createTicketAutomatic(orderId) {
 
     if (error || !trx) return;
 
-    // Cek duplikasi tiket
+    // Cek duplikasi tiket (biar gak double)
     const { data: existing } = await supabase
         .from('tickets')
         .select('id')
