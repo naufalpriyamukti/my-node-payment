@@ -4,11 +4,10 @@ require('dotenv').config();
 
 // --- INIT ---
 console.log("--- [INIT] SERVER STARTING ---");
-console.log("Midtrans Key:", process.env.MIDTRANS_SERVER_KEY ? "LOADED" : "MISSING");
-console.log("Supabase URL:", process.env.SUPABASE_URL ? "LOADED" : "MISSING");
+console.log("Is Production:", false);
 
 let core = new midtransClient.CoreApi({
-    isProduction: false, // SANDBOX
+    isProduction: false,
     serverKey: process.env.MIDTRANS_SERVER_KEY,
     clientKey: process.env.MIDTRANS_CLIENT_KEY
 });
@@ -18,27 +17,32 @@ const supabase = createClient(
     process.env.SUPABASE_SERVICE_KEY
 );
 
-// --- 1. CHARGE (Buat Transaksi) ---
+// --- 1. CHARGE ---
 exports.charge = async (req, res) => {
     try {
         const { amount, paymentType, customerName, customerEmail, userId, eventId, tribunName } = req.body;
 
-        // GENERATE ORDER ID (Server Side) - Pasti Pendek & Unik
+        // 1. GENERATE ID (5-6 DIGIT ANGKA)
         const randomSuff = Math.floor(Math.random() * 1000).toString().padStart(3, '0');
         const timeSec = new Date().getSeconds().toString();
         const serverOrderId = `${timeSec}${randomSuff}`; 
 
-        console.log(`\n--- [REQ] NEW CHARGE: ${serverOrderId} ---`);
-
+        console.log(`\n=============================================`);
+        console.log(`[REQ] START TRANSACTION`);
+        console.log(`Generated Order ID : ${serverOrderId}`);
+        console.log(`Payment Type       : ${paymentType}`);
+        console.log(`Amount             : ${amount}`);
+        
         if (!amount || !paymentType) {
-            return res.status(400).json({ status: false, message: "Data amount/paymentType tidak lengkap" });
+            return res.status(400).json({ status: false, message: "Data tidak lengkap" });
         }
 
+        // 2. SETUP PARAMETER
         let parameter = {
             "payment_type": paymentType === 'alfamart' ? 'cstore' : 'bank_transfer',
             "transaction_details": {
                 "gross_amount": parseInt(amount),
-                "order_id": serverOrderId,
+                "order_id": serverOrderId, 
             },
             "customer_details": {
                 "first_name": customerName || "Customer",
@@ -48,30 +52,46 @@ exports.charge = async (req, res) => {
 
         if (['bca', 'bni', 'bri', 'permata'].includes(paymentType)) {
             parameter.payment_type = "bank_transfer";
-            parameter.bank_transfer = { "bank": paymentType };
+            parameter.bank_transfer = { 
+                "bank": paymentType,
+                "va_number": serverOrderId // <--- PAKSA AGAR VA = ORDER ID (Khusus BCA kadang butuh ini)
+            };
         } else if (paymentType === 'alfamart') {
             parameter.payment_type = "cstore";
-            parameter.cstore = { "store": "alfamart", "message": "Tiketons Payment" };
+            parameter.cstore = { "store": "alfamart", "message": "Tiketons" };
         }
 
-        // Request ke Midtrans
+        // 3. TEMBAK KE MIDTRANS
+        console.log(`[PROCESS] Sending to Midtrans...`);
         const chargeResponse = await core.charge(parameter);
-        console.log("[MIDTRANS] Charge Response Code:", chargeResponse.status_code);
 
-        // Ambil VA / Payment Code
+        // --- LOGGING PENTING (YANG KAMU MINTA) ---
+        console.log(`---------------------------------------------`);
+        console.log(`[MIDTRANS RESPONSE]`);
+        console.log(`Status Code : ${chargeResponse.status_code}`);
+        console.log(`Order ID    : ${chargeResponse.order_id}`);
+        
+        // Cek VA yang didapat
         let vaNumber = null;
         let bankName = paymentType;
 
         if (chargeResponse.va_numbers && chargeResponse.va_numbers.length > 0) {
              vaNumber = chargeResponse.va_numbers[0].va_number;
              bankName = chargeResponse.va_numbers[0].bank;
+             console.log(`VA Number   : ${vaNumber} (Bank: ${bankName})`);
         } else if (chargeResponse.permata_va_number) {
              vaNumber = chargeResponse.permata_va_number;
+             console.log(`VA Permata  : ${vaNumber}`);
         } else if (chargeResponse.payment_code) {
             vaNumber = chargeResponse.payment_code;
+            console.log(`Pay Code    : ${vaNumber} (Alfamart)`);
+        } else {
+            console.log(`VA Number   : TIDAK DITEMUKAN DI RESPONSE!`);
+            console.log(`Full JSON   : ${JSON.stringify(chargeResponse)}`);
         }
+        console.log(`---------------------------------------------`);
 
-        // Simpan ke DB
+        // 4. SIMPAN KE DB
         const { error: insertError } = await supabase
             .from('transactions')
             .insert({
@@ -86,12 +106,13 @@ exports.charge = async (req, res) => {
                 created_at: new Date()
             });
 
-        if (insertError) console.error("[DB ERROR] Insert Failed:", insertError.message);
-        else console.log("[DB SUCCESS] Data Saved");
+        if (insertError) console.error("[DB ERROR]", insertError.message);
+        else console.log("[DB SUCCESS] Data Saved to Supabase");
+        console.log(`=============================================\n`);
 
         return res.json({
             status: true,
-            message: "Transaksi Berhasil Dibuat",
+            message: "Transaksi Berhasil",
             data: {
                 order_id: chargeResponse.order_id,
                 total_amount: chargeResponse.gross_amount,
@@ -102,74 +123,61 @@ exports.charge = async (req, res) => {
         });
 
     } catch (error) {
-        console.error("[CRITICAL ERROR]:", error.message);
+        console.error("[CRITICAL ERROR]", error.message);
+        // Print detail error dari Midtrans jika ada
+        if(error.ApiResponse) {
+            console.error("[MIDTRANS ERROR DETAIL]", JSON.stringify(error.ApiResponse, null, 2));
+        }
         return res.status(500).json({ status: false, message: error.message });
     }
 };
 
-// --- 2. NOTIFICATION (Webhook) ---
+// --- 2. NOTIFICATION ---
 exports.notification = async (req, res) => {
     try {
         console.log("\n--- [WEBHOOK] NOTIFICATION RECEIVED ---");
-        
         const statusResponse = await core.transaction.notification(req.body);
         const orderId = statusResponse.order_id;
         const transactionStatus = statusResponse.transaction_status;
         const fraudStatus = statusResponse.fraud_status;
 
-        console.log(`Order: ${orderId} | Status: ${transactionStatus} | Fraud: ${fraudStatus}`);
+        console.log(`Order: ${orderId} | Status: ${transactionStatus}`);
 
-        // --- LOGIKA STATUS LENGKAP ---
         let finalStatus = 'PENDING';
-
         if (transactionStatus == 'capture') {
-            if (fraudStatus == 'challenge') {
-                finalStatus = 'CHALLENGE';
-            } else if (fraudStatus == 'accept') {
-                finalStatus = 'SUCCESS';
-            }
+            if (fraudStatus == 'challenge') finalStatus = 'CHALLENGE';
+            else if (fraudStatus == 'accept') finalStatus = 'SUCCESS';
         } else if (transactionStatus == 'settlement') {
-            finalStatus = 'SUCCESS'; // Uang masuk (Transfer sukses)
-        } else if (transactionStatus == 'cancel' || transactionStatus == 'deny' || transactionStatus == 'expire') {
-            finalStatus = 'FAILED'; // Gagal/Batal/Kadaluarsa
-        } else if (transactionStatus == 'pending') {
-            finalStatus = 'PENDING';
+            finalStatus = 'SUCCESS';
+        } else if (['cancel', 'deny', 'expire'].includes(transactionStatus)) {
+            finalStatus = 'FAILED';
         }
 
-        console.log(`[DB] Updating status to: ${finalStatus}`);
-
-        // Update DB
         const { error } = await supabase
             .from('transactions')
             .update({ status: finalStatus })
             .eq('order_id', orderId);
 
-        if (error) console.error("[DB ERROR] Update Status Failed:", error.message);
-        else console.log("[DB SUCCESS] Status Updated!");
-
-        // Jika SUKSES, buat Tiket
+        if (error) console.error("[DB ERROR]", error.message);
+        
         if (finalStatus === 'SUCCESS') {
             await createTicketAutomatic(orderId);
         }
 
         return res.status(200).send('OK');
     } catch (error) {
-        console.error("[WEBHOOK ERROR]:", error.message);
+        console.error("[WEBHOOK ERROR]", error.message);
         return res.status(500).send('Error');
     }
 };
 
-// Helper: Create Ticket
 async function createTicketAutomatic(orderId) {
     try {
-        console.log(`[TICKET] Creating ticket for ${orderId}...`);
-        
         const { data: trx } = await supabase.from('transactions').select('*').eq('order_id', orderId).single();
         if (!trx) return;
-
         const { data: event } = await supabase.from('events').select('*').eq('id', trx.event_id).single();
-
-        const { error } = await supabase.from('tickets').insert({
+        
+        await supabase.from('tickets').insert({
             transaction_id: orderId,
             user_id: trx.user_id,
             event_name: event ? event.name : "Event",
@@ -179,11 +187,6 @@ async function createTicketAutomatic(orderId) {
             qr_code: `QR-${orderId}-${Date.now()}`,
             is_used: false
         });
-        
-        if (!error) console.log(`[TICKET] Created Successfully!`);
-        else console.error(`[TICKET ERROR] ${error.message}`);
-
-    } catch (e) {
-        console.error("[TICKET EXCEPTION]", e);
-    }
+        console.log(`[TICKET] Created for ${orderId}`);
+    } catch (e) { console.error(e); }
 }
