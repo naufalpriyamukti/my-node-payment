@@ -4,14 +4,14 @@ require('dotenv').config();
 
 // --- 0. DEBUGGING AWAL (Cek apakah env terbaca) ---
 console.log("--- [INIT] SERVER STARTING ---");
-console.log("Is Production Mode:", false); // Karena hardcoded false
+console.log("Is Production Mode:", false); 
 console.log("Midtrans Server Key Loaded:", process.env.MIDTRANS_SERVER_KEY ? "YES (****" + process.env.MIDTRANS_SERVER_KEY.slice(-4) + ")" : "NO (UNDEFINED)");
 console.log("Supabase URL Loaded:", process.env.SUPABASE_URL ? "YES" : "NO");
 console.log("Supabase Key Loaded:", process.env.SUPABASE_SERVICE_KEY ? "YES (****" + process.env.SUPABASE_SERVICE_KEY.slice(-4) + ")" : "NO");
 
 // 1. Inisialisasi Midtrans
 let core = new midtransClient.CoreApi({
-    isProduction: false, // <--- INI ARTINYA PAKAI SANDBOX (SIMULATOR)
+    isProduction: false, // SANDBOX
     serverKey: process.env.MIDTRANS_SERVER_KEY,
     clientKey: process.env.MIDTRANS_CLIENT_KEY
 });
@@ -25,16 +25,26 @@ const supabase = createClient(
 // --- ENDPOINT 1: REQUEST BAYAR ---
 exports.charge = async (req, res) => {
     try {
-        const { orderId, amount, paymentType, customerName, customerEmail, userId, eventId, tribunName } = req.body;
+        // PERUBAHAN 1: Hapus 'orderId' dari req.body (Kita tidak percaya Android)
+        const { amount, paymentType, customerName, customerEmail, userId, eventId, tribunName } = req.body;
 
-        // DEBUG: Cek data yang masuk dari Android
+        // PERUBAHAN 2: GENERATE ID DI SINI (Server Side Generation)
+        // Logika: Ambil detik saat ini + 3 angka acak.
+        // Hasil: Pasti Angka, Pasti Pendek (5-6 Digit), Pasti Unik.
+        const randomSuff = Math.floor(Math.random() * 1000).toString().padStart(3, '0');
+        const timeSec = new Date().getSeconds().toString();
+        const serverOrderId = `${timeSec}${randomSuff}`; 
+
+        // DEBUG: Cek data
         console.log(`\n--- [REQ] CHARGE REQUEST ---`);
-        console.log(`OrderID: ${orderId}, Amount: ${amount}, Type: ${paymentType}`);
+        console.log(`[SERVER] Generated NEW OrderID: ${serverOrderId} (Short & Numeric)`);
+        console.log(`Amount: ${amount}, Type: ${paymentType}`);
         console.log(`User: ${customerName} (${userId})`);
 
-        if (!orderId || !amount || !paymentType) {
+        // Validasi (Hapus validasi orderId)
+        if (!amount || !paymentType) {
             console.error("[ERROR] Data tidak lengkap!");
-            return res.status(400).json({ status: false, message: "Data tidak lengkap" });
+            return res.status(400).json({ status: false, message: "Data amount/paymentType tidak lengkap" });
         }
 
         // Setup Parameter
@@ -42,7 +52,7 @@ exports.charge = async (req, res) => {
             "payment_type": paymentType === 'alfamart' ? 'cstore' : 'bank_transfer',
             "transaction_details": {
                 "gross_amount": parseInt(amount),
-                "order_id": orderId,
+                "order_id": serverOrderId, // <--- PAKAI ID DARI SERVER
             },
             "customer_details": {
                 "first_name": customerName || "Customer",
@@ -59,13 +69,11 @@ exports.charge = async (req, res) => {
         }
 
         // 1. Request ke Midtrans
-        console.log(`[PROCESS] Menghubungi Midtrans...`);
+        console.log(`[PROCESS] Menghubungi Midtrans dengan ID: ${serverOrderId}...`);
         
-        // TRY CATCH KHUSUS MIDTRANS UNTUK MELIHAT RESPONSE RAW
         let chargeResponse;
         try {
             chargeResponse = await core.charge(parameter);
-            // LOG PENTING: Response Asli Midtrans
             console.log("[DEBUG] Midtrans Response RAW:", JSON.stringify(chargeResponse, null, 2));
         } catch (midError) {
             console.error("[ERROR] Midtrans Request Failed:", midError.message);
@@ -87,11 +95,11 @@ exports.charge = async (req, res) => {
 
         console.log(`[INFO] VA Number didapat: ${vaNumber}`);
 
-        // 3. Simpan ke Database
+        // 3. Simpan ke Database (PAKAI serverOrderId)
         const { error: insertError } = await supabase
             .from('transactions')
             .insert({
-                order_id: orderId,
+                order_id: serverOrderId, // <--- UPDATE INI JUGA
                 user_id: userId,
                 event_id: eventId,
                 amount: amount,
@@ -103,11 +111,8 @@ exports.charge = async (req, res) => {
             });
 
         if (insertError) {
-            // LOG LENGKAP SUPABASE ERROR
             console.error("--- [ERROR] GAGAL SIMPAN DB ---");
-            console.error("Code:", insertError.code);
-            console.error("Message:", insertError.message);
-            console.error("Hint:", insertError.hint || "No hint");
+            console.error(insertError);
         } else {
             console.log("[SUCCESS] Data tersimpan di Database Supabase");
         }
@@ -130,7 +135,7 @@ exports.charge = async (req, res) => {
     }
 };
 
-// --- ENDPOINT 2: NOTIFIKASI ---
+// --- ENDPOINT 2: NOTIFIKASI (TIDAK ADA PERUBAHAN) ---
 exports.notification = async (req, res) => {
     try {
         console.log("\n--- [WEBHOOK] NOTIFIKASI MASUK ---");
