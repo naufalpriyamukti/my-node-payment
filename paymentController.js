@@ -20,7 +20,8 @@ const supabase = createClient(
 // --- 1. CHARGE ---
 exports.charge = async (req, res) => {
     try {
-        const { amount, paymentType, customerName, customerEmail, userId, eventId, tribunName } = req.body;
+        // PERBAIKAN: Tambahkan 'eventName' di sini agar terbaca dari Android
+        const { amount, paymentType, customerName, customerEmail, userId, eventId, eventName, tribunName } = req.body;
 
         // 1. GENERATE ID (5-6 DIGIT ANGKA)
         const randomSuff = Math.floor(Math.random() * 1000).toString().padStart(3, '0');
@@ -32,6 +33,7 @@ exports.charge = async (req, res) => {
         console.log(`Generated Order ID : ${serverOrderId}`);
         console.log(`Payment Type       : ${paymentType}`);
         console.log(`Amount             : ${amount}`);
+        console.log(`Event Name         : ${eventName}`); // Log Event Name
         
         if (!amount || !paymentType) {
             return res.status(400).json({ status: false, message: "Data tidak lengkap" });
@@ -54,7 +56,7 @@ exports.charge = async (req, res) => {
             parameter.payment_type = "bank_transfer";
             parameter.bank_transfer = { 
                 "bank": paymentType,
-                "va_number": serverOrderId // <--- PAKSA AGAR VA = ORDER ID (Khusus BCA kadang butuh ini)
+                "va_number": serverOrderId // <--- PAKSA AGAR VA = ORDER ID (Khusus BCA)
             };
         } else if (paymentType === 'alfamart') {
             parameter.payment_type = "cstore";
@@ -65,7 +67,7 @@ exports.charge = async (req, res) => {
         console.log(`[PROCESS] Sending to Midtrans...`);
         const chargeResponse = await core.charge(parameter);
 
-        // --- LOGGING PENTING (YANG KAMU MINTA) ---
+        // --- LOGGING PENTING ---
         console.log(`---------------------------------------------`);
         console.log(`[MIDTRANS RESPONSE]`);
         console.log(`Status Code : ${chargeResponse.status_code}`);
@@ -98,6 +100,7 @@ exports.charge = async (req, res) => {
                 order_id: serverOrderId,
                 user_id: userId,
                 event_id: eventId,
+                event_name: eventName || "Event Tiketons", // <--- PERBAIKAN: SIMPAN NAMA EVENT
                 amount: amount,
                 payment_type: bankName,
                 va_number: vaNumber,
@@ -175,12 +178,15 @@ async function createTicketAutomatic(orderId) {
     try {
         const { data: trx } = await supabase.from('transactions').select('*').eq('order_id', orderId).single();
         if (!trx) return;
+        
+        // Ambil data event dari tabel events (backup)
         const { data: event } = await supabase.from('events').select('*').eq('id', trx.event_id).single();
         
         await supabase.from('tickets').insert({
             transaction_id: orderId,
             user_id: trx.user_id,
-            event_name: event ? event.name : "Event",
+            // Gunakan nama event dari transaksi (jika ada), atau fallback ke tabel event
+            event_name: trx.event_name || (event ? event.name : "Event"), 
             event_date: event ? event.date : new Date(),
             location: event ? event.location : "-",
             tribun: trx.tribun,
