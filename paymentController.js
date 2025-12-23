@@ -20,8 +20,11 @@ const supabase = createClient(
 // --- 1. CHARGE ---
 exports.charge = async (req, res) => {
     try {
-        // PERBAIKAN: Tambahkan 'eventName' di sini agar terbaca dari Android
-        const { amount, paymentType, customerName, customerEmail, userId, eventId, eventName, tribunName } = req.body;
+        const { amount, paymentType, customerName, customerEmail, userId, eventId, tribunName } = req.body;
+
+        // --- UPDATE 1: TANGKAP EVENT NAME DARI ANDROID ---
+        // Prioritaskan 'event_name' (snake_case) karena itu yang dikirim Android
+        const incomingEventName = req.body.event_name || req.body.eventName || "Event Tiketons";
 
         // 1. GENERATE ID (5-6 DIGIT ANGKA)
         const randomSuff = Math.floor(Math.random() * 1000).toString().padStart(3, '0');
@@ -33,7 +36,7 @@ exports.charge = async (req, res) => {
         console.log(`Generated Order ID : ${serverOrderId}`);
         console.log(`Payment Type       : ${paymentType}`);
         console.log(`Amount             : ${amount}`);
-        console.log(`Event Name         : ${eventName}`); // Log Event Name
+        console.log(`Event Name         : ${incomingEventName}`); // Log Nama Event
         
         if (!amount || !paymentType) {
             return res.status(400).json({ status: false, message: "Data tidak lengkap" });
@@ -56,7 +59,7 @@ exports.charge = async (req, res) => {
             parameter.payment_type = "bank_transfer";
             parameter.bank_transfer = { 
                 "bank": paymentType,
-                "va_number": serverOrderId // <--- PAKSA AGAR VA = ORDER ID (Khusus BCA)
+                "va_number": serverOrderId // <--- PAKSA AGAR VA = ORDER ID
             };
         } else if (paymentType === 'alfamart') {
             parameter.payment_type = "cstore";
@@ -94,13 +97,14 @@ exports.charge = async (req, res) => {
         console.log(`---------------------------------------------`);
 
         // 4. SIMPAN KE DB
+        // --- UPDATE 2: SIMPAN EVENT_NAME KE TRANSAKSI ---
         const { error: insertError } = await supabase
             .from('transactions')
             .insert({
                 order_id: serverOrderId,
                 user_id: userId,
                 event_id: eventId,
-                event_name: eventName || "Event Tiketons", // <--- PERBAIKAN: SIMPAN NAMA EVENT
+                event_name: incomingEventName, // <--- Simpan Nama Event di sini
                 amount: amount,
                 payment_type: bankName,
                 va_number: vaNumber,
@@ -127,7 +131,6 @@ exports.charge = async (req, res) => {
 
     } catch (error) {
         console.error("[CRITICAL ERROR]", error.message);
-        // Print detail error dari Midtrans jika ada
         if(error.ApiResponse) {
             console.error("[MIDTRANS ERROR DETAIL]", JSON.stringify(error.ApiResponse, null, 2));
         }
@@ -174,11 +177,12 @@ exports.notification = async (req, res) => {
     }
 };
 
+// --- UPDATE 3: LOGIKA TIKET YANG LEBIH KUAT ---
 async function createTicketAutomatic(orderId) {
     try {
         console.log(`[TICKET] Processing ticket for Order ID: ${orderId}...`);
-        
-        // 1. Ambil data Transaksi
+
+        // 1. Ambil Data Transaksi
         const { data: trx, error: errTrx } = await supabase
             .from('transactions')
             .select('*')
@@ -190,7 +194,7 @@ async function createTicketAutomatic(orderId) {
             return;
         }
 
-        // 2. Ambil data Event (Fallback)
+        // 2. Tentukan Data Event (Ambil dari trx.event_name dulu, baru fallback ke tabel events)
         let finalEventName = trx.event_name;
         let finalEventDate = new Date();
         let finalEventLoc = "-";
@@ -203,38 +207,40 @@ async function createTicketAutomatic(orderId) {
                 .single();
             
             if (event) {
-                if (!finalEventName || finalEventName === 'undefined') finalEventName = event.name;
+                // Jika di transaksi kosong/default, pakai dari tabel master
+                if (!finalEventName || finalEventName === 'Event Tiketons') {
+                    finalEventName = event.name;
+                }
                 finalEventDate = event.date;
                 finalEventLoc = event.location;
             }
         }
 
-        // 3. Insert Tiket (DENGAN CEK ERROR YANG BENAR)
-        const { error: errTiket } = await supabase
-            .from('tickets')
-            .insert({
-                transaction_id: orderId,
-                user_id: trx.user_id,
-                event_name: finalEventName || "Event Tiketons",
-                event_date: finalEventDate,
-                location: finalEventLoc,
-                tribun: trx.tribun,
-                qr_code: `QR-${orderId}-${Date.now()}`,
-                is_used: false
-            });
-        
-        // --- PERBAIKAN LOGIKA LOGGING ---
+        // 3. Simpan Tiket
+        const { error: errTiket } = await supabase.from('tickets').insert({
+            transaction_id: orderId,
+            user_id: trx.user_id,
+            event_name: finalEventName || "Event Spesial", // Pastikan tidak kosong
+            event_date: finalEventDate,
+            location: finalEventLoc,
+            tribun: trx.tribun,
+            qr_code: `QR-${orderId}-${Date.now()}`,
+            is_used: false
+        });
+
         if (errTiket) {
-            console.error("#############################################");
-            console.error("[TICKET FAILED] Gagal Simpan ke Database!");
-            console.error("Pesan Error Supabase:", errTiket.message); // <--- INI KUNCINYA
-            console.error("Detail Error:", errTiket.details);
-            console.error("#############################################");
+            // Cek jika errornya duplikat (abaikan saja kalau duplikat)
+            if (errTiket.code === '23505') {
+                console.log("[TICKET INFO] Tiket sudah ada (Skip Duplicate).");
+            } else {
+                console.error("[TICKET FAILED] Gagal Simpan ke Database!");
+                console.error(`Pesan Error Supabase: ${errTiket.message}`);
+            }
         } else {
-            console.log("[TICKET SUCCESS] Tiket BERHASIL masuk tabel tickets!");
+            console.log(`[TICKET SUCCESS] Tiket berhasil dibuat untuk ${orderId}`);
         }
 
-    } catch (e) {
-        console.error("[TICKET EXCEPTION]", e);
+    } catch (e) { 
+        console.error("[TICKET EXCEPTION]", e); 
     }
 }
