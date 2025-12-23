@@ -176,23 +176,65 @@ exports.notification = async (req, res) => {
 
 async function createTicketAutomatic(orderId) {
     try {
-        const { data: trx } = await supabase.from('transactions').select('*').eq('order_id', orderId).single();
-        if (!trx) return;
+        console.log(`[TICKET] Processing ticket for Order ID: ${orderId}...`);
         
-        // Ambil data event dari tabel events (backup)
-        const { data: event } = await supabase.from('events').select('*').eq('id', trx.event_id).single();
+        // 1. Ambil data Transaksi
+        const { data: trx, error: errTrx } = await supabase
+            .from('transactions')
+            .select('*')
+            .eq('order_id', orderId)
+            .single();
+
+        if (errTrx || !trx) {
+            console.error("[TICKET ERROR] Transaksi tidak ditemukan:", errTrx?.message);
+            return;
+        }
+
+        // 2. Ambil data Event (Fallback)
+        let finalEventName = trx.event_name;
+        let finalEventDate = new Date();
+        let finalEventLoc = "-";
+
+        if (trx.event_id) {
+            const { data: event } = await supabase
+                .from('events')
+                .select('*')
+                .eq('id', trx.event_id)
+                .single();
+            
+            if (event) {
+                if (!finalEventName || finalEventName === 'undefined') finalEventName = event.name;
+                finalEventDate = event.date;
+                finalEventLoc = event.location;
+            }
+        }
+
+        // 3. Insert Tiket (DENGAN CEK ERROR YANG BENAR)
+        const { error: errTiket } = await supabase
+            .from('tickets')
+            .insert({
+                transaction_id: orderId,
+                user_id: trx.user_id,
+                event_name: finalEventName || "Event Tiketons",
+                event_date: finalEventDate,
+                location: finalEventLoc,
+                tribun: trx.tribun,
+                qr_code: `QR-${orderId}-${Date.now()}`,
+                is_used: false
+            });
         
-        await supabase.from('tickets').insert({
-            transaction_id: orderId,
-            user_id: trx.user_id,
-            // Gunakan nama event dari transaksi (jika ada), atau fallback ke tabel event
-            event_name: trx.event_name || (event ? event.name : "Event"), 
-            event_date: event ? event.date : new Date(),
-            location: event ? event.location : "-",
-            tribun: trx.tribun,
-            qr_code: `QR-${orderId}-${Date.now()}`,
-            is_used: false
-        });
-        console.log(`[TICKET] Created for ${orderId}`);
-    } catch (e) { console.error(e); }
+        // --- PERBAIKAN LOGIKA LOGGING ---
+        if (errTiket) {
+            console.error("#############################################");
+            console.error("[TICKET FAILED] Gagal Simpan ke Database!");
+            console.error("Pesan Error Supabase:", errTiket.message); // <--- INI KUNCINYA
+            console.error("Detail Error:", errTiket.details);
+            console.error("#############################################");
+        } else {
+            console.log("[TICKET SUCCESS] Tiket BERHASIL masuk tabel tickets!");
+        }
+
+    } catch (e) {
+        console.error("[TICKET EXCEPTION]", e);
+    }
 }
