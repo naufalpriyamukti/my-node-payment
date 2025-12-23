@@ -1,7 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
-const paymentController = require('./paymentController');
+const paymentController = require('./paymentController'); // Pastikan path file benar
 require('dotenv').config();
 
 const app = express();
@@ -15,12 +15,12 @@ app.get('/', (req, res) => {
     res.send('Tiketons Payment Gateway is Running...');
 });
 
-// 1. Android panggil ini untuk minta Kode Bayar
+// 1. Android panggil ini untuk buat transaksi (Generate ID & VA)
 app.post('/api/payment/charge', paymentController.charge);
 
-// 2. Midtrans panggil ini (Otomatis) untuk lapor status bayar
+// 2. Midtrans panggil ini (Webhook) untuk lapor status SUKSES/GAGAL
 app.post('/api/payment/notification', paymentController.notification);
 
 app.listen(PORT, () => {
-    console.log(`Server berjalan di http://localhost:${PORT}`);
+    console.log(`Server berjalan di port ${PORT}`);
 });
